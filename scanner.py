@@ -131,8 +131,7 @@ class OCSScanner:
         self._chain_lock = threading.Lock()
         self.scan_stats: dict = {
             s: {"pcr": 0, "max_pain": 0, "status": "Waiting...",
-                "last_scan": "--:--:--", "atm": 0,
-                "cond": {"pcr": None, "mp": None, "oi": None, "iv": None, "ba": None}}
+                "last_scan": "--:--:--", "atm": 0}
             for s in SYMBOLS
         }
 
@@ -303,25 +302,6 @@ class OCSScanner:
         ce_oi_chg = ((ce_oi - prev_oi.get("ce", ce_oi)) / (prev_oi.get("ce", ce_oi) + 1)) * 100
         ce_iv_spk = ((ce_iv - prev_iv.get("ce", ce_iv)) / (prev_iv.get("ce", ce_iv) + 0.01)) * 100
         pe_iv_spk = ((pe_iv - prev_iv.get("pe", pe_iv)) / (prev_iv.get("pe", pe_iv) + 0.01)) * 100
-
-        # Determine dominant bias for condition display (CE favoured if pcr < 1, else PE)
-        if pcr < 1.0:
-            cond = {
-                "pcr": pcr < PCR_CE_THRESHOLD,
-                "mp":  ltp > max_pain,
-                "oi":  pe_oi_chg < -OI_REDUCE_PCT,
-                "iv":  ce_iv_spk > IV_SPIKE_PCT,
-                "ba":  ce_bid > ce_ask,
-            }
-        else:
-            cond = {
-                "pcr": pcr > PCR_PE_THRESHOLD,
-                "mp":  ltp < max_pain,
-                "oi":  ce_oi_chg < -OI_REDUCE_PCT,
-                "iv":  pe_iv_spk > IV_SPIKE_PCT,
-                "ba":  pe_ask > pe_bid,
-            }
-        self.scan_stats[symbol]["cond"] = cond
 
         # CE: all 5 conditions
         if (pcr < PCR_CE_THRESHOLD and ltp > max_pain and
