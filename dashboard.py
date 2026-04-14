@@ -5,10 +5,6 @@
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
-# ── Gevent monkey-patch MUST be first ──
-from gevent import monkey
-monkey.patch_all()
-
 import os
 import json
 import logging
@@ -35,7 +31,7 @@ SYMBOL_TOKENS = {
 
 app      = Flask(__name__)
 app.config["SECRET_KEY"] = "oc_scanner_2025"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 # ── Shared state ──
 _tick_data = {
@@ -45,14 +41,12 @@ _tick_data = {
         "volume": 0, "time": "--:--:--",
         "status": "Waiting...", "pcr": 0, "max_pain": 0, "atm": 0,
         "last_scan": "--:--:--",
-        "cond": {"pcr": None, "mp": None, "oi": None, "iv": None, "ba": None},
     }
     for info in SYMBOL_TOKENS.values()
 }
 _active_trades: dict = {}
 _ticker = None
 _scanner_ref = None
-
 
 def set_active_trade(symbol: str, trade_data):
     """Called by scanner when trade opens/closes."""
@@ -69,7 +63,6 @@ def set_active_trade(symbol: str, trade_data):
         if _active_trades else None
     })
 
-
 def push_scan_update(symbol: str, data: dict):
     """Called by scanner after each chain check."""
     key = next((v["key"] for k, v in SYMBOL_TOKENS.items()
@@ -82,7 +75,6 @@ def push_scan_update(symbol: str, data: dict):
         "max_pain":  data.get("max_pain", 0),
         "atm":       data.get("atm", 0),
         "last_scan": data.get("last_scan", "--:--:--"),
-        "cond":      data.get("cond", {"pcr": None, "mp": None, "oi": None, "iv": None, "ba": None}),
     })
     socketio.emit("scan_update", {"sym": key, **_tick_data[key]})
 
@@ -104,6 +96,7 @@ def start_ticker(access_token: str, scanner=None):
             tok  = tick.get("instrument_token")
             info = SYMBOL_TOKENS.get(tok)
             if not info:
+                # Pass option ticks to scanner
                 if _scanner_ref:
                     _scanner_ref.on_tick([tick])
                 continue
@@ -127,9 +120,7 @@ def start_ticker(access_token: str, scanner=None):
                 "change": chg, "change_pct": chgp, "time": now_s,
             })
 
-            # Also update active trade cur_ltp if it's for this symbol
-            # (option ticks update cur_ltp directly via scanner.on_tick)
-
+            # Push to all browsers instantly
             socketio.emit("tick", {
                 "sym": key, "ltp": round(ltp, 2),
                 "high": round(high, 2), "low": round(low, 2),
@@ -137,16 +128,18 @@ def start_ticker(access_token: str, scanner=None):
                 "change_pct": chgp, "volume": vol, "time": now_s,
             })
 
+            # Also pass index tick to scanner
             if _scanner_ref:
                 _scanner_ref.on_tick([tick])
 
     def on_connect(ws, response):
         log.info("KiteTicker connected.")
-        all_tokens  = list(SYMBOL_TOKENS.keys())
-        index_tokens = list(SYMBOL_TOKENS.keys())
+        all_tokens = list(SYMBOL_TOKENS.keys())
         if _scanner_ref:
             all_tokens += _scanner_ref.get_all_tokens()
-        opt_tokens = [t for t in all_tokens if t not in index_tokens]
+        # Remove duplicates
+        index_tokens = list(SYMBOL_TOKENS.keys())
+        opt_tokens   = [t for t in all_tokens if t not in index_tokens]
 
         ws.subscribe(index_tokens)
         ws.set_mode(ws.MODE_FULL, index_tokens)
@@ -187,13 +180,8 @@ def api_snapshot():
                 trades = json.load(f)
         except Exception:
             pass
-    active = None
-    if _active_trades:
-        a = list(_active_trades.values())[0]
-        sym = a.get("symbol")
-        tr  = _scanner_ref.active_trades.get(sym) if _scanner_ref else None
-        active = {**a, "cur_ltp": tr["cur_ltp"] if tr else a.get("cur_ltp", a.get("entry", 0))}
-    return {"market": _tick_data, "trades": trades, "active": active}
+    return {"market": _tick_data, "trades": trades,
+            "active": list(_active_trades.values())[0] if _active_trades else None}
 
 @app.route("/api/trades")
 def api_trades():
@@ -207,13 +195,7 @@ def api_trades():
 
 @app.route("/api/active")
 def api_active():
-    if not _active_trades:
-        return {"active": None}
-    a   = list(_active_trades.values())[0]
-    sym = a.get("symbol")
-    tr  = _scanner_ref.active_trades.get(sym) if _scanner_ref else None
-    cur_ltp = tr["cur_ltp"] if tr else a.get("cur_ltp", a.get("entry", 0))
-    return {"active": {**a, "cur_ltp": cur_ltp}}
+    return {"active": list(_active_trades.values())[0] if _active_trades else None}
 
 @socketio.on("connect")
 def on_client_connect():
@@ -224,14 +206,9 @@ def on_client_connect():
                 trades = json.load(f)
         except Exception:
             pass
-    active = None
-    if _active_trades:
-        a   = list(_active_trades.values())[0]
-        sym = a.get("symbol")
-        tr  = _scanner_ref.active_trades.get(sym) if _scanner_ref else None
-        active = {**a, "cur_ltp": tr["cur_ltp"] if tr else a.get("cur_ltp", a.get("entry", 0))}
     socketio.emit("snapshot", {
-        "market": _tick_data, "trades": trades, "active": active
+        "market": _tick_data, "trades": trades,
+        "active": list(_active_trades.values())[0] if _active_trades else None
     })
 
 
@@ -264,7 +241,7 @@ header{background:#12151f;border-bottom:1px solid #1e2535;padding:12px 20px;
 .container{max-width:1280px;margin:0 auto;padding:18px 14px}
 .section-label{font-size:10px;color:#4a5568;text-transform:uppercase;letter-spacing:1.2px;margin-bottom:10px;padding-left:2px}
 
-/* ── Market Grid ── */
+/* ── Market Grid (4 cards) ── */
 .mgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}
 @media(max-width:900px){.mgrid{grid-template-columns:1fr 1fr}}
 @media(max-width:520px){.mgrid{grid-template-columns:1fr}}
@@ -308,18 +285,6 @@ header{background:#12151f;border-bottom:1px solid #1e2535;padding:12px 20px;
 .status-trade-pe{color:#fc8181;font-weight:700}
 .status-err{color:#fc8181}
 .status-wait{color:#4a5568}
-
-/* ── Conditions Bar ── */
-.cond-bar{display:flex;gap:4px;margin-top:7px;flex-wrap:wrap}
-.cond-pill{display:flex;align-items:center;gap:3px;font-size:9px;font-weight:700;
-  padding:2px 6px;border-radius:8px;letter-spacing:.3px;border:1px solid transparent}
-.cond-pass{background:#1a3a2a;color:#48bb78;border-color:#2d6a4a}
-.cond-fail{background:#3a1a1a;color:#fc8181;border-color:#6a2d2d}
-.cond-wait{background:#1a1d2e;color:#4a5568;border-color:#2d3748}
-.cond-dot{width:5px;height:5px;border-radius:50%;flex-shrink:0}
-.cond-dot-g{background:#48bb78}
-.cond-dot-r{background:#fc8181}
-.cond-dot-y{background:#4a5568}
 
 /* ── Active Trade ── */
 .atrade-wrap{margin-bottom:20px}
@@ -383,7 +348,6 @@ tr:last-child td{border-bottom:none}tr:hover td{background:#1a1d2e}
         <div class="scan-item"><span class="scan-lbl">ATM</span><span class="scan-val" id="nf-atm">—</span></div>
         <div class="scan-item"><span class="scan-lbl">Status</span><span class="scan-val" id="nf-status">Waiting...</span></div>
         <div class="scan-item"><span class="scan-lbl">Last Scan</span><span class="scan-val" style="color:#4a5568" id="nf-scan-ts">—</span></div>
-        <div class="cond-bar" id="nf-conds"></div>
       </div>
     </div>
 
@@ -401,7 +365,6 @@ tr:last-child td{border-bottom:none}tr:hover td{background:#1a1d2e}
         <div class="scan-item"><span class="scan-lbl">ATM</span><span class="scan-val" id="bn-atm">—</span></div>
         <div class="scan-item"><span class="scan-lbl">Status</span><span class="scan-val" id="bn-status">Waiting...</span></div>
         <div class="scan-item"><span class="scan-lbl">Last Scan</span><span class="scan-val" style="color:#4a5568" id="bn-scan-ts">—</span></div>
-        <div class="cond-bar" id="bn-conds"></div>
       </div>
     </div>
 
@@ -419,7 +382,6 @@ tr:last-child td{border-bottom:none}tr:hover td{background:#1a1d2e}
         <div class="scan-item"><span class="scan-lbl">ATM</span><span class="scan-val" id="fn-atm">—</span></div>
         <div class="scan-item"><span class="scan-lbl">Status</span><span class="scan-val" id="fn-status">Waiting...</span></div>
         <div class="scan-item"><span class="scan-lbl">Last Scan</span><span class="scan-val" style="color:#4a5568" id="fn-scan-ts">—</span></div>
-        <div class="cond-bar" id="fn-conds"></div>
       </div>
     </div>
 
@@ -437,7 +399,6 @@ tr:last-child td{border-bottom:none}tr:hover td{background:#1a1d2e}
         <div class="scan-item"><span class="scan-lbl">ATM</span><span class="scan-val" id="sx-atm">—</span></div>
         <div class="scan-item"><span class="scan-lbl">Status</span><span class="scan-val" id="sx-status">Waiting...</span></div>
         <div class="scan-item"><span class="scan-lbl">Last Scan</span><span class="scan-val" style="color:#4a5568" id="sx-scan-ts">—</span></div>
-        <div class="cond-bar" id="sx-conds"></div>
       </div>
     </div>
 
@@ -484,8 +445,6 @@ function fn(n,d=2){return n==null||isNaN(n)?'—':Number(n).toLocaleString('en-I
 function fp(n){if(n==null||isNaN(n))return'—';const s=n<0?'-':'+';return s+'₹'+Math.abs(n).toLocaleString('en-IN',{maximumFractionDigits:0});}
 
 const prevLtp={nf:0,bn:0,fn:0,sx:0};
-// option LTP cache keyed by sym_key — updated from active_trade events
-const optLtp={nf:0,bn:0,fn:0,sx:0};
 
 // ── Tick Update ──
 function applyTick(d){
@@ -515,22 +474,6 @@ function applyTick(d){
   }
 }
 
-// ── Conditions Bar ──
-const COND_LABELS={pcr:'PCR',mp:'MaxPain',oi:'OI↓',iv:'IV↑',ba:'Bid>Ask'};
-function applyCondBar(s, cond){
-  const el=document.getElementById(s+'-conds');
-  if(!el||!cond)return;
-  let html='';
-  Object.entries(COND_LABELS).forEach(([k,label])=>{
-    const v=cond[k];
-    let cls='cond-wait',dc='cond-dot-y';
-    if(v===true){cls='cond-pass';dc='cond-dot-g';}
-    else if(v===false){cls='cond-fail';dc='cond-dot-r';}
-    html+=`<span class="cond-pill ${cls}"><span class="cond-dot ${dc}"></span>${label}</span>`;
-  });
-  el.innerHTML=html;
-}
-
 // ── Scan Update ──
 function applyScan(d){
   const s=d.sym;
@@ -552,10 +495,9 @@ function applyScan(d){
        st.includes('Scan')?'status-scan':
        st.includes('Error')?'status-err':'status-wait');
   }
-  if(d.cond) applyCondBar(s, d.cond);
 }
 
-// ── Active Trade — uses cur_ltp from scanner (option LTP) ──
+// ── Active Trade ──
 function renderActive(a){
   const panel=document.getElementById('active-panel');
   if(!a){
@@ -563,11 +505,9 @@ function renderActive(a){
     panel.innerHTML='No open position';
     return;
   }
-  // cur_ltp is the option's live LTP from scanner; fallback to entry
-  const ltp = (a.cur_ltp && a.cur_ltp > 0) ? a.cur_ltp : (a.entry||0);
+  const ltp=prevLtp[a.sym_key]||a.entry;
   const entry=a.entry||0;
-  const lotSize=(a.symbol==='BANKNIFTY'?15:a.symbol==='SENSEX'?10:a.symbol==='FINNIFTY'?40:50);
-  const pnl=(ltp-entry)*lotSize;
+  const pnl=(ltp-entry)*((a.symbol==='BANKNIFTY'?15:a.symbol==='SENSEX'?10:a.symbol==='FINNIFTY'?40:50));
   const pct=entry?(ltp-entry)/entry*100:0;
   const pc=pnl>=0?'#48bb78':'#fc8181';
   const dc=a.direction==='CALL'?'#48bb78':'#fc8181';
@@ -581,13 +521,13 @@ function renderActive(a){
       <div class="at-box"><div class="at-lbl">Option</div><div class="at-val" style="font-size:11px;color:#a0aec0">${a.option_symbol||'—'}</div></div>
       <div class="at-box"><div class="at-lbl">Side</div><div class="at-val" style="color:${dc}">${a.side||'—'}</div></div>
       <div class="at-box"><div class="at-lbl">Entry</div><div class="at-val">₹${(entry).toFixed(2)}</div></div>
-      <div class="at-box"><div class="at-lbl">Live LTP</div><div class="at-val" id="at-live-ltp" style="color:${ltp>=entry?'#48bb78':'#fc8181'}">₹${ltp.toFixed(2)}</div></div>
+      <div class="at-box"><div class="at-lbl">Live LTP</div><div class="at-val" style="color:${ltp>=entry?'#48bb78':'#fc8181'}">₹${ltp.toFixed(2)}</div></div>
       <div class="at-box"><div class="at-lbl">SL</div><div class="at-val" style="color:#fc8181">₹${(a.sl||0).toFixed(2)}</div></div>
       <div class="at-box"><div class="at-lbl">Target</div><div class="at-val" style="color:#48bb78">₹${(a.target||0).toFixed(2)}</div></div>
       <div class="at-box"><div class="at-lbl">Opened</div><div class="at-val" style="font-size:12px;color:#a0aec0">${a.open_time||'—'}</div></div>
       <div class="at-box" style="border:1px solid ${pc}44">
         <div class="at-lbl">Live P&L</div>
-        <div class="at-pnl" id="at-live-pnl" style="color:${pc}">${pnl>=0?'+':''}₹${Math.round(Math.abs(pnl)).toLocaleString('en-IN')} (${pct>=0?'+':''}${pct.toFixed(1)}%)</div>
+        <div class="at-pnl" style="color:${pc}">${pnl>=0?'+':''}₹${Math.round(Math.abs(pnl)).toLocaleString('en-IN')} (${pct>=0?'+':''}${pct.toFixed(1)}%)</div>
       </div>
     </div>`;
 }
@@ -646,12 +586,12 @@ socket.on('snapshot', d=>{
   if(d.active!==undefined) renderActive(d.active);
 });
 
-// Poll active trade every 2s — uses cur_ltp from /api/active (option LTP)
+// Poll active trade P&L tick by tick update
 setInterval(()=>{
   const panel=document.getElementById('active-panel');
   if(!panel.classList.contains('atrade'))return;
   fetch('/api/active').then(r=>r.json()).then(d=>renderActive(d.active)).catch(()=>{});
-},2000);
+},3000);
 
 setInterval(()=>{
   fetch('/api/trades').then(r=>r.json()).then(renderTrades).catch(()=>{});
@@ -666,7 +606,7 @@ setInterval(()=>{
 # ─────────────────────────────────────────────
 def run_dashboard():
     socketio.run(app, host="0.0.0.0", port=PORT,
-                 debug=False, use_reloader=False)
+                 debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
 
 if __name__ == "__main__":
     run_dashboard()
