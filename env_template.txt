@@ -1,0 +1,15 @@
+# ─────────────────────────────────────────────────────
+#  Railway Environment Variables
+#  Railway dashboard → Your project → Variables tab mein
+#  yeh sab add karo
+# ─────────────────────────────────────────────────────
+
+API_KEY=yj3cey9o0ho0gi1b
+API_SECRET=YOUR_API_SECRET_HERE
+KITE_USER_ID=YOUR_ZERODHA_USER_ID
+KITE_PASSWORD=YOUR_ZERODHA_PASSWORD
+TOTP_SECRET=YOUR_TOTP_SECRET_BASE32
+TELEGRAM_TOKEN=8620220458:AAG-oxvhWhPio7iX9pWCk-0AFovl5KrUXxc
+TELEGRAM_CHAT_ID=5112248039
+
+# Railway automatically sets PORT — do NOT add PORT manually
