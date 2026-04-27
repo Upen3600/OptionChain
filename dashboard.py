@@ -31,7 +31,7 @@ SYMBOL_TOKENS = {
 
 app      = Flask(__name__)
 app.config["SECRET_KEY"] = "friday_dual_beta_2025"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # ── Shared state ──
 _tick_data = {
@@ -270,8 +270,7 @@ header{background:#0e1120;border-bottom:1px solid #1e2535;padding:12px 20px;
 .hero-name{font-size:11px;font-weight:700;letter-spacing:1.5px;color:#718096;margin-bottom:6px}
 .hero-ltp{font-size:44px;font-weight:900;letter-spacing:-1px;font-variant-numeric:tabular-nums;
   transition:color .15s;line-height:1}
-.hero-ltp.flash-up{color:#48bb78 !important;text-shadow:0 0 20px #48bb7850}
-.hero-ltp.flash-dn{color:#fc8181 !important;text-shadow:0 0 20px #fc818150}
+
 .hero-card.nf .hero-ltp{color:#f87171}
 .hero-card.bn .hero-ltp{color:#818cf8}
 .hero-meta{display:flex;gap:12px;align-items:center;margin-top:8px;flex-wrap:wrap}
@@ -301,7 +300,6 @@ header{background:#0e1120;border-bottom:1px solid #1e2535;padding:12px 20px;
 .mc-badge{font-size:10px;padding:2px 7px;border-radius:10px;font-weight:700}
 .bo{background:#1a3a2a;color:#48bb78}.bc{background:#2a1a1a;color:#fc8181}.bp{background:#2a2a1a;color:#f6c90e}
 .ltp{font-size:22px;font-weight:900;color:#fff;font-variant-numeric:tabular-nums;display:block;margin-bottom:2px}
-.ltp.flash-up{color:#48bb78 !important}.ltp.flash-dn{color:#fc8181 !important}
 .chg-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
 .chg{font-size:11px;font-weight:700;padding:2px 6px;border-radius:5px}
 .tick-time{font-size:10px;color:#4a5568}
@@ -470,12 +468,6 @@ function applyTick(d){
   const el=document.getElementById(s+'-ltp');
   if(!el)return;
   const prev=prevLtp[s],ltp=d.ltp;
-  if(prev&&ltp!==prev){
-    el.classList.remove('flash-up','flash-dn');
-    void el.offsetWidth;
-    el.classList.add(ltp>prev?'flash-up':'flash-dn');
-    setTimeout(()=>el.classList.remove('flash-up','flash-dn'),350);
-  }
   prevLtp[s]=ltp;
   el.textContent=fn(ltp);
 
@@ -664,8 +656,11 @@ setInterval(()=>{
 #  START
 # ─────────────────────────────────────────────
 def run_dashboard():
+    import eventlet
+    import eventlet.wsgi
+    eventlet.monkey_patch()
     socketio.run(app, host="0.0.0.0", port=PORT,
-                 debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
+                 debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":
