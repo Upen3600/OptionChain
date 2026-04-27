@@ -5,6 +5,10 @@
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
+# ✅ FIX: monkey_patch SABSE PEHLE — kisi bhi import se pehle
+from gevent import monkey
+monkey.patch_all()
+
 import os
 import sys
 import subprocess
@@ -100,7 +104,6 @@ def start():
     def token_refresh_loop():
         while True:
             now = datetime.now(IST)
-            # Sleep until next 8:45 IST
             target_h, target_m = 8, 45
             secs_now = now.hour * 3600 + now.minute * 60 + now.second
             secs_tgt = target_h * 3600 + target_m * 60
