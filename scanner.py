@@ -1,7 +1,8 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   OC CONFLUENCE SCANNER — Core Pattern Engine                    ║
-║   5-condition pattern: PCR + MaxPain + OI + IV + BidAsk          ║
+║   FRIDAY DUAL-BETA — Pattern Engine (Refactored for Railway)     ║
+║   BankNifty + Nifty | F5 + Reversal + Mean Reversion            ║
+║   SL & Targets: Option Premium Price Based                       ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
@@ -12,7 +13,8 @@ import logging
 import threading
 import requests
 import pandas as pd
-from datetime import datetime, date
+import pandas_ta as ta
+from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 from kiteconnect import KiteConnect
 
@@ -27,63 +29,37 @@ TRADE_FILE = "/tmp/trades_log.json"
 API_KEY          = os.environ.get("API_KEY",          "yj3cey9o0ho0gi1b")
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN",   "8620220458:AAG-oxvhWhPio7iX9pWCk-0AFovl5KrUXxc")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5112248039")
+CANDLE_CHAT_ID   = os.environ.get("CANDLE_CHAT_ID",   "5112248039")  # same or different
 
-SYMBOLS = {
-    "NIFTY": {
-        "index_token": 256265,
-        "exchange":    "NFO",
-        "lot_size":    50,
-        "sl_points":   30,
-        "target_step": 50,
-        "strike_step": 50,
-        "dash_key":    "nf",
-    },
-    "BANKNIFTY": {
-        "index_token": 260105,
-        "exchange":    "NFO",
-        "lot_size":    15,
-        "sl_points":   50,
-        "target_step": 50,
-        "strike_step": 100,
-        "dash_key":    "bn",
-    },
-    "FINNIFTY": {
-        "index_token": 257801,
-        "exchange":    "NFO",
-        "lot_size":    40,
-        "sl_points":   30,
-        "target_step": 50,
-        "strike_step": 50,
-        "dash_key":    "fn",
-    },
-    "SENSEX": {
-        "index_token": 265,
-        "exchange":    "BFO",
-        "lot_size":    10,
-        "sl_points":   100,
-        "target_step": 50,
-        "strike_step": 100,
-        "dash_key":    "sx",
-    },
-}
+BANKNIFTY_TOKEN = 260105
+NIFTY_TOKEN     = 256265
 
-PCR_CE_THRESHOLD = 0.8
-PCR_PE_THRESHOLD = 1.2
-IV_SPIKE_PCT     = 10
-OI_REDUCE_PCT    = 5
-CHAIN_REFRESH_S  = 5    # REST chain refresh interval
+# Option SL/Target config (in premium points)
+BN_OPT_SL      = 30   # SL: 30 pts below option buy price
+BN_OPT_TARGET1 = 50   # Target 1: 50 pts above option buy price
+BN_OPT_TRAIL   = 50   # Trail step
+BN_OPT_LOT     = 30   # BankNifty lot size / qty per lot
 
+NF_OPT_SL      = 20
+NF_OPT_TARGET1 = 30
+NF_OPT_TRAIL   = 30
+NF_OPT_LOT     = 75   # Nifty lot size
 
 # ─────────────────────────────────────────────
 #  TELEGRAM
 # ─────────────────────────────────────────────
-def send_telegram(msg: str):
+def send_telegram(msg: str, chat_id: str = None):
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    cid = chat_id or TELEGRAM_CHAT_ID
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg,
+        requests.post(url, json={"chat_id": cid, "text": msg,
                                   "parse_mode": "HTML"}, timeout=10)
     except Exception as e:
         log.error(f"Telegram: {e}")
+
+
+def send_candle_alert(msg: str):
+    send_telegram(msg, CANDLE_CHAT_ID)
 
 
 # ─────────────────────────────────────────────
@@ -96,6 +72,7 @@ def is_market_open() -> bool:
     t = now.hour * 60 + now.minute
     return 9 * 60 + 15 <= t <= 15 * 60 + 30
 
+
 def market_session() -> str:
     now = datetime.now(IST)
     if now.weekday() >= 5:
@@ -107,294 +84,743 @@ def market_session() -> str:
 
 
 # ─────────────────────────────────────────────
-#  SCANNER CLASS
+#  ATM + OPTION HELPER
+# ─────────────────────────────────────────────
+def get_atm_strike(ltp: float, step: int) -> int:
+    return int(round(ltp / step) * step)
+
+
+def get_option_symbol(instruments: list, strike: int, side: str, name: str) -> str:
+    """Get nearest expiry option symbol from instruments list."""
+    today = date.today()
+    best = None
+    best_exp = None
+    for inst in instruments:
+        if inst.get("name", "").upper() != name.upper():
+            continue
+        if inst.get("instrument_type", "") != side:
+            continue
+        if int(inst.get("strike", 0)) != strike:
+            continue
+        exp = inst.get("expiry")
+        if not exp:
+            continue
+        if isinstance(exp, str):
+            exp = date.fromisoformat(exp)
+        elif hasattr(exp, 'date'):
+            exp = exp.date()
+        if exp < today:
+            continue
+        if best_exp is None or exp < best_exp:
+            best_exp = exp
+            best = inst.get("tradingsymbol", "")
+    return best or ""
+
+
+def get_option_ltp(kite, symbol: str, exchange: str = "NFO") -> float:
+    if not symbol:
+        return 0.0
+    try:
+        q = kite.quote([f"{exchange}:{symbol}"])
+        return float(q.get(f"{exchange}:{symbol}", {}).get("last_price", 0) or 0)
+    except Exception as e:
+        log.error(f"Option LTP [{symbol}]: {e}")
+        return 0.0
+
+
+# ─────────────────────────────────────────────
+#  INDICATORS
+# ─────────────────────────────────────────────
+def calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    df["EMA9"]   = ta.ema(df["close"], length=9)
+    df["EMA20"]  = ta.ema(df["close"], length=20)
+    df["EMA50"]  = ta.ema(df["close"], length=50)
+    df["EMA200"] = ta.ema(df["close"], length=200)
+    df["RSI"]    = ta.rsi(df["close"], length=14)
+    df["ATR3"]   = ta.atr(df["high"], df["low"], df["close"], length=3)
+    df["Body"]   = abs(df["close"] - df["open"])
+    df["Range"]  = df["high"] - df["low"]
+    df["Upper_Wick"] = df["high"] - df[["open", "close"]].max(axis=1)
+    df["Lower_Wick"] = df[["open", "close"]].min(axis=1) - df["low"]
+    bb = ta.bbands(df["close"], length=20, std=2)
+    if bb is not None:
+        df["BBL"] = bb.iloc[:, 0]
+        df["BBM"] = bb.iloc[:, 1]
+        df["BBU"] = bb.iloc[:, 2]
+    return df
+
+
+# ─────────────────────────────────────────────
+#  MAIN SCANNER CLASS
 # ─────────────────────────────────────────────
 class OCSScanner:
     def __init__(self, access_token: str,
                  on_trade_open=None, on_trade_close=None, on_scan_update=None):
-        self.kite           = KiteConnect(api_key=API_KEY)
+        self.kite = KiteConnect(api_key=API_KEY)
         self.kite.set_access_token(access_token)
-        self.access_token   = access_token
+        self.access_token = access_token
 
-        self.on_trade_open  = on_trade_open   or (lambda s, t: None)
-        self.on_trade_close = on_trade_close  or (lambda s: None)
-        self.on_scan_update = on_scan_update  or (lambda s, d: None)
+        self.on_trade_open  = on_trade_open  or (lambda s, t: None)
+        self.on_trade_close = on_trade_close or (lambda s: None)
+        self.on_scan_update = on_scan_update or (lambda s, d: None)
 
-        # State
-        self.index_ltp:    dict = {s: 0.0 for s in SYMBOLS}
-        self.active_trades: dict = {}
-        self.chain_cache:   dict = {}
-        self.option_token_map: dict = {}  # token -> (symbol, CE/PE, strike)
-        self.option_prices:    dict = {}  # (sym, side, strike) -> ltp
-        self._prev_oi: dict = {}
-        self._prev_iv: dict = {}
-        self._chain_lock = threading.Lock()
-        self.scan_stats: dict = {
-            s: {"pcr": 0, "max_pain": 0, "status": "Waiting...",
-                "last_scan": "--:--:--", "atm": 0}
-            for s in SYMBOLS
+        # Index LTP
+        self.index_ltp = {"BANKNIFTY": 0.0, "NIFTY": 0.0}
+
+        # Candle stores
+        self._candles   = {"BANKNIFTY": [], "NIFTY": []}
+        self._ws_states = {
+            "BANKNIFTY": {"current_candle": None, "current_time": None},
+            "NIFTY":     {"current_candle": None, "current_time": None},
         }
 
-        # Build instrument map at startup
-        self._build_map()
+        # NFO instruments
+        self._nfo_instruments = []
 
-        # Start chain refresh loop
-        threading.Thread(target=self._chain_loop, daemon=True).start()
+        # Active trades dict per symbol
+        self.active_trades: dict = {}
+
+        # Pending reversal signals
+        self._pending_reversal: dict = {}
+
+        # Mean reversion active
+        self._mr_state: dict = {}
+
+        # Scan stats for dashboard
+        self.scan_stats = {
+            "BANKNIFTY": {"status": "Loading...", "last_scan": "--:--:--"},
+            "NIFTY":     {"status": "Loading...", "last_scan": "--:--:--"},
+        }
+
+        # Load historical candles + instruments
+        threading.Thread(target=self._init_data, daemon=True).start()
 
     def set_token(self, token: str):
         self.access_token = token
         self.kite.set_access_token(token)
 
-    # ── Instrument Map ──────────────────────────────────────────────
-    def _build_map(self):
-        log.info("Building instrument map...")
-        for symbol, cfg in SYMBOLS.items():
-            try:
-                exchange = cfg["exchange"]
-                expiry   = self._nearest_expiry(symbol, exchange)
-                instr    = pd.DataFrame(self.kite.instruments(exchange))
-                instr    = instr[(instr["name"] == symbol) &
-                                 (instr["expiry"].astype(str) == expiry)]
-                for _, row in instr.iterrows():
-                    tok = int(row["instrument_token"])
-                    self.option_token_map[tok] = (
-                        symbol, row["instrument_type"], int(row["strike"]))
-                log.info(f"  {symbol}: {len(instr)} strikes, expiry {expiry}")
-            except Exception as e:
-                log.error(f"Map build error [{symbol}]: {e}")
-        log.info(f"Token map: {len(self.option_token_map)} option tokens")
-
+    # ── Returns tokens for KiteTicker subscription ─────────────────
     def get_all_tokens(self) -> list:
-        """All tokens to subscribe (index + options)."""
-        index_tokens = [cfg["index_token"] for cfg in SYMBOLS.values()]
-        opt_tokens   = list(self.option_token_map.keys())
-        return index_tokens + opt_tokens
+        return [BANKNIFTY_TOKEN, NIFTY_TOKEN]
 
-    # ── Tick Handler (called from KiteTicker) ───────────────────────
+    # ── Init: load candles & instruments ───────────────────────────
+    def _init_data(self):
+        try:
+            log.info("Loading historical candles...")
+            end   = datetime.now()
+            start = end - timedelta(days=10)
+
+            for sym, tok in [("BANKNIFTY", BANKNIFTY_TOKEN), ("NIFTY", NIFTY_TOKEN)]:
+                data = self.kite.historical_data(tok, start, end, "15minute")
+                if data:
+                    df = pd.DataFrame(data)
+                    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None)
+                    df = calc_indicators(df)
+                    self._candles[sym] = df.tail(500).to_dict("records")
+                    log.info(f"{sym}: {len(self._candles[sym])} candles loaded")
+
+            log.info("Loading NFO instruments...")
+            self._nfo_instruments = self.kite.instruments("NFO")
+            log.info(f"NFO instruments: {len(self._nfo_instruments)}")
+
+            self.scan_stats["BANKNIFTY"]["status"] = "Scanning..."
+            self.scan_stats["NIFTY"]["status"]     = "Scanning..."
+            send_telegram(
+                "🚀 <b>Friday Dual-Beta Engine Online</b>\n"
+                "📊 BankNifty + Nifty Patterns Active\n"
+                "⚡ Option-Price Based SL & Targets"
+            )
+        except Exception as e:
+            log.error(f"Init error: {e}")
+
+    # ── Tick handler (called from dashboard ticker) ─────────────────
     def on_tick(self, ticks: list):
         for tick in ticks:
             tok = tick.get("instrument_token")
             ltp = tick.get("last_price", 0)
 
-            # Index tick
-            for sym, cfg in SYMBOLS.items():
-                if tok == cfg["index_token"]:
-                    self.index_ltp[sym] = ltp
-                    # Monitor active trade on every index tick
-                    tr = self.active_trades.get(sym)
-                    if tr and tr.get("token"):
-                        opt_ltp = self.option_prices.get(
-                            (sym, tr["side"], tr["strike"]), tr["entry"])
-                        self._monitor(sym, opt_ltp)
-                    break
+            if tok == BANKNIFTY_TOKEN:
+                self.index_ltp["BANKNIFTY"] = ltp
+                self._check_active_trade("BANKNIFTY", ltp)
+                self._check_reversal_trigger("BANKNIFTY", ltp)
+                self._build_candle("BANKNIFTY", ltp)
 
-            # Option tick
-            if tok in self.option_token_map:
-                sym, side, strike = self.option_token_map[tok]
-                self.option_prices[(sym, side, strike)] = ltp
-                # Update active trade cur_ltp in real-time
-                tr = self.active_trades.get(sym)
-                if tr and tr.get("side") == side and tr.get("strike") == strike:
-                    tr["cur_ltp"] = ltp
+            elif tok == NIFTY_TOKEN:
+                self.index_ltp["NIFTY"] = ltp
+                self._check_active_trade("NIFTY", ltp)
+                self._check_reversal_trigger("NIFTY", ltp)
+                self._build_candle("NIFTY", ltp)
 
-    # ── Chain Refresh Loop (REST every 5s) ──────────────────────────
-    def _chain_loop(self):
-        while True:
-            if is_market_open():
-                for symbol in SYMBOLS:
-                    if symbol in self.active_trades:
-                        continue
-                    try:
-                        self._refresh_chain(symbol)
-                        with self._chain_lock:
-                            chain = self.chain_cache.get(symbol, pd.DataFrame())
-                        ltp = self.index_ltp.get(symbol, 0)
-                        if ltp > 0 and not chain.empty:
-                            result = self._check_pattern(symbol, ltp, chain)
-                            self.scan_stats[symbol]["last_scan"] = (
-                                datetime.now(IST).strftime("%H:%M:%S"))
-                            if result:
-                                self._open_trade(symbol, result)
-                            else:
-                                self.scan_stats[symbol]["status"] = "Scanning..."
-                        self.on_scan_update(symbol, self.scan_stats[symbol])
-                    except Exception as e:
-                        log.error(f"Chain loop [{symbol}]: {e}")
-                        self.scan_stats[symbol]["status"] = "Error"
-            time.sleep(CHAIN_REFRESH_S)
-
-    def _refresh_chain(self, symbol: str):
-        cfg      = SYMBOLS[symbol]
-        exchange = cfg["exchange"]
-        expiry   = self._nearest_expiry(symbol, exchange)
-        instr    = pd.DataFrame(self.kite.instruments(exchange))
-        df       = instr[(instr["name"] == symbol) &
-                         (instr["expiry"].astype(str) == expiry)].copy()
-        if df.empty:
+    # ── 15-min Candle Builder ───────────────────────────────────────
+    def _build_candle(self, sym: str, price: float):
+        if not is_market_open():
             return
-        tokens  = df["instrument_token"].tolist()
-        quotes  = {}
-        for i in range(0, len(tokens), 500):
-            batch = df[df["instrument_token"].isin(tokens[i:i+500])]
-            keys  = [f"{exchange}:{r['tradingsymbol']}" for _, r in batch.iterrows()]
-            quotes.update(self.kite.quote(keys))
-        rows = []
-        for _, row in df.iterrows():
-            key = f"{exchange}:{row['tradingsymbol']}"
-            if key not in quotes:
+
+        now    = datetime.now()
+        minute = (now.minute // 15) * 15
+        ctime  = now.replace(minute=minute, second=0, microsecond=0)
+        state  = self._ws_states[sym]
+
+        if state["current_time"] != ctime:
+            # Candle closed — store and scan
+            if state["current_candle"]:
+                self._candles[sym].append(state["current_candle"])
+                self._candles[sym] = self._candles[sym][-500:]
+                df = pd.DataFrame(self._candles[sym])
+                df = calc_indicators(df)
+                self._on_candle_close(sym, df)
+
+            state["current_time"]   = ctime
+            state["current_candle"] = {
+                "date": ctime, "open": price,
+                "high": price, "low": price, "close": price,
+            }
+        else:
+            c = state["current_candle"]
+            c["high"]  = max(c["high"],  price)
+            c["low"]   = min(c["low"],   price)
+            c["close"] = price
+
+    def _on_candle_close(self, sym: str, df: pd.DataFrame):
+        """Called when 15-min candle closes — run all scanners."""
+        last = df.iloc[-1]
+
+        # Candle alert to telegram
+        msg = (
+            f"📊 <b>{sym} 15M CANDLE</b>\n"
+            f"🕒 {last.get('date', '')}\n"
+            f"O:{round(last['open'],2)}  H:{round(last['high'],2)}  "
+            f"L:{round(last['low'],2)}  C:{round(last['close'],2)}\n"
+            f"EMA9:{round(last['EMA9'],1)}  EMA20:{round(last['EMA20'],1)}  "
+            f"EMA50:{round(last['EMA50'],1)}"
+        )
+        send_candle_alert(msg)
+
+        # Run scanners only if no active trade for this symbol
+        if sym not in self.active_trades:
+            self._scan_friday5(sym, df)
+            self._scan_reversal(sym, df)
+            self._scan_mean_reversion(sym, df)
+
+        self.scan_stats[sym]["last_scan"] = datetime.now(IST).strftime("%H:%M:%S")
+        self.on_scan_update(sym, self.scan_stats[sym])
+
+    # ─────────────────────────────────────────────
+    #  FRIDAY5 PATTERN SCANNER
+    # ─────────────────────────────────────────────
+    def _scan_friday5(self, sym: str, df: pd.DataFrame):
+        if not is_market_open() or sym in self.active_trades:
+            return
+
+        now = datetime.now(IST).time()
+        t1s = datetime.strptime("09:25", "%H:%M").time()
+        t1e = datetime.strptime("13:15", "%H:%M").time()
+        t2s = datetime.strptime("13:30", "%H:%M").time()
+        t2e = datetime.strptime("15:15", "%H:%M").time()
+        if not ((t1s <= now <= t1e) or (t2s <= now <= t2e)):
+            return
+
+        row   = df.iloc[-1]
+        prev  = df.iloc[-2]
+        prev2 = df.iloc[-3]
+
+        ema9, ema20, ema50 = row["EMA9"], row["EMA20"], row["EMA50"]
+        body, range_       = row["Body"], row["Range"]
+        upper, lower       = row["Upper_Wick"], row["Lower_Wick"]
+        rsi, atr           = row["RSI"], row["ATR3"]
+
+        is_bn = sym == "BANKNIFTY"
+
+        # ── Filters ──
+        if is_bn:
+            if atr < 20 or range_ > 200 or abs(ema9 - ema20) < 25: return
+            if body < 10: return
+            if range_ > 0 and (upper / range_ > 0.35 or lower / range_ > 0.35): return
+            if 45 <= rsi <= 55: return
+            if abs(row["EMA9"] - prev["EMA9"]) < 5: return
+        else:
+            if atr < 8 or range_ > 80 or abs(ema9 - ema20) < 10: return
+            if body < 5: return
+            if range_ > 0 and (upper / range_ > 0.35 or lower / range_ > 0.35): return
+            if 45 <= rsi <= 55: return
+
+        signals = []
+        step    = 100 if is_bn else 50
+
+        # Pattern2: EMA trend + expansion candle
+        p2_min_range = 120 if is_bn else 45
+        p2_min_body  = 40  if is_bn else 15
+        p2_prev_max  = 100 if is_bn else 35
+
+        if (range_ >= p2_min_range and body >= p2_min_body
+                and ema9 > ema20 > ema50
+                and prev["Range"] < p2_prev_max
+                and row["Range"] > prev["Range"]
+                and row["close"] > row["open"]):
+            signals.append(("Pattern2", "CE"))
+
+        if (range_ >= p2_min_range and body >= p2_min_body
+                and ema9 < ema20 < ema50
+                and prev["Range"] < p2_prev_max
+                and row["Range"] > prev["Range"]
+                and row["close"] < row["open"]):
+            signals.append(("Pattern2", "PE"))
+
+        # Pattern2.1: Box breakout
+        box_max  = 150 if is_bn else 55
+        p21_rng  = 120 if is_bn else 45
+        last_5_high = df.iloc[-6:-1]["high"].max()
+        last_5_low  = df.iloc[-6:-1]["low"].min()
+        box_size    = last_5_high - last_5_low
+
+        if (range_ >= p21_rng and row["close"] > row["open"]
+                and box_size < box_max and row["close"] > last_5_high
+                and (row["close"] > ema9 or row["close"] > ema20 or row["close"] > ema50)):
+            signals.append(("Pattern2.1", "CE"))
+
+        if (range_ >= p21_rng and row["close"] < row["open"]
+                and box_size < box_max and row["close"] < last_5_low
+                and (row["close"] < ema9 or row["close"] < ema20 or row["close"] < ema50)):
+            signals.append(("Pattern2.1", "PE"))
+
+        # Pattern4: Momentum big candle
+        p4_rng  = 140 if is_bn else 55
+        p4_body = 35  if is_bn else 12
+
+        if range_ >= p4_rng and body >= p4_body and range_ > 0:
+            if upper / range_ < 0.25 and lower / range_ < 0.25:
+                if ema9 > ema20 > ema50 and row["close"] > row["open"]:
+                    signals.append(("Pattern4", "CE"))
+                if ema9 < ema20 < ema50 and row["close"] < row["open"]:
+                    signals.append(("Pattern4", "PE"))
+
+        # Pattern6_Pro: Higher High / Lower Low breakout
+        brk_min = 15 if is_bn else 5
+        move_max = 150 if is_bn else 60
+
+        if prev["low"] < prev2["low"] and row["close"] > prev["high"] and ema9 > ema20:
+            brk = row["close"] - prev["high"]
+            if brk >= brk_min:
+                recent_high = df.iloc[-10:-1]["high"].max()
+                if (row["close"] >= recent_high
+                        and row["Body"] >= row["Range"] * 0.5
+                        and row["high"] - row["close"] <= row["Body"]):
+                    recent_low = df.iloc[-10:-1]["low"].min()
+                    if row["close"] - recent_low <= move_max:
+                        signals.append(("Pattern6_Pro", "CE"))
+
+        if prev["high"] > prev2["high"] and row["close"] < prev["low"] and ema9 < ema20:
+            brk = prev["low"] - row["close"]
+            if brk >= brk_min:
+                recent_low = df.iloc[-10:-1]["low"].min()
+                if (row["close"] <= recent_low
+                        and row["Body"] >= row["Range"] * 0.5
+                        and row["close"] - row["low"] <= row["Body"]):
+                    recent_high = df.iloc[-10:-1]["high"].max()
+                    if recent_high - row["close"] <= move_max:
+                        signals.append(("Pattern6_Pro", "PE"))
+
+        # ── Execute best signal ──
+        buf = 50 if is_bn else 20
+        for pattern, side in signals:
+            if sym in self.active_trades:
+                break
+
+            entry_index = self.index_ltp[sym]
+            if entry_index == 0:
                 continue
-            q   = quotes[key]
-            dep = q.get("depth", {})
-            rows.append({
-                "strike":        int(row["strike"]),
-                "option_type":   row["instrument_type"],
-                "ltp":           q.get("last_price", 0) or 0,
-                "oi":            q.get("oi", 0) or 0,
-                "iv":            q.get("implied_volatility", 0) or 0,
-                "bid_qty":       sum(b.get("quantity", 0) for b in dep.get("buy",  [])[:5]),
-                "ask_qty":       sum(a.get("quantity", 0) for a in dep.get("sell", [])[:5]),
-                "token":         int(row["instrument_token"]),
-                "tradingsymbol": row["tradingsymbol"],
-            })
-        if not rows:
+
+            # EMA clear path filter
+            if side == "CE":
+                if entry_index < ema20 < entry_index + buf: continue
+                if entry_index < ema50 < entry_index + buf: continue
+            else:
+                if entry_index > ema20 > entry_index - buf: continue
+                if entry_index > ema50 > entry_index - buf: continue
+
+            # Get option
+            name_key = "BANKNIFTY" if is_bn else "NIFTY"
+            opt_step = 100 if is_bn else 50
+            strike = get_atm_strike(entry_index, opt_step)
+            opt_sym = get_option_symbol(self._nfo_instruments, strike, side, name_key)
+            opt_ltp = get_option_ltp(self.kite, opt_sym)
+
+            if opt_ltp <= 0:
+                log.warning(f"Option LTP zero for {opt_sym}, skipping")
+                continue
+
+            # SL & Target based on OPTION PREMIUM price
+            opt_sl      = is_bn and BN_OPT_SL  or NF_OPT_SL
+            opt_t1      = is_bn and BN_OPT_TARGET1 or NF_OPT_TARGET1
+            lot_qty     = is_bn and BN_OPT_LOT or NF_OPT_LOT
+
+            sl_price     = round(opt_ltp - opt_sl, 1)
+            target_price = round(opt_ltp + opt_t1, 1)
+
+            trade = {
+                "symbol":        sym,
+                "pattern":       pattern,
+                "side":          side,
+                "direction":     "CALL" if side == "CE" else "PUT",
+                "entry_index":   entry_index,
+                "option_symbol": opt_sym,
+                "strike":        strike,
+                "entry":         opt_ltp,        # option buy price
+                "sl":            sl_price,        # option sl
+                "target":        target_price,    # option target1
+                "peak":          opt_ltp,
+                "cur_ltp":       opt_ltp,
+                "target_level":  0,
+                "open_time":     datetime.now(IST).strftime("%H:%M:%S"),
+                "lots":          1,
+                "lot_qty":       lot_qty,
+                "sym_key":       "bn" if is_bn else "nf",
+                "token":         0,
+            }
+            self.active_trades[sym] = trade
+            self.scan_stats[sym]["status"] = f"TRADE {side}"
+            self.on_trade_open(sym, trade)
+
+            em = "🔵" if side == "CE" else "🔴"
+            send_telegram(
+                f"{em} <b>{sym} FRIDAY5 SIGNAL</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📌 <b>Pattern:</b> {pattern}\n"
+                f"📊 <b>Side:</b> BUY {side} — {opt_sym}\n"
+                f"💰 <b>Option Entry:</b> ₹{opt_ltp}\n"
+                f"🛑 <b>Option SL:</b> ₹{sl_price}  (−{opt_sl} pts)\n"
+                f"🎯 <b>Option T1:</b> ₹{target_price}  (+{opt_t1} pts)\n"
+                f"📈 <b>Index Entry:</b> {entry_index}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🕐 {datetime.now(IST).strftime('%d %b %Y  %H:%M:%S')}"
+            )
+            log.info(f"[{sym}] Trade opened: {pattern} {side} @ opt={opt_ltp}")
+            break
+
+    # ─────────────────────────────────────────────
+    #  REVERSAL SCANNER
+    # ─────────────────────────────────────────────
+    def _scan_reversal(self, sym: str, df: pd.DataFrame):
+        if not is_market_open():
             return
-        df_oc = pd.DataFrame(rows)
-        ce    = df_oc[df_oc["option_type"] == "CE"].set_index("strike").add_prefix("ce_")
-        pe    = df_oc[df_oc["option_type"] == "PE"].set_index("strike").add_prefix("pe_")
-        chain = ce.join(pe, how="outer").reset_index()
-        with self._chain_lock:
-            self.chain_cache[symbol] = chain
+        if sym in self.active_trades or sym in self._pending_reversal:
+            return
 
-    # ── Pattern Logic ────────────────────────────────────────────────
-    def _check_pattern(self, symbol: str, ltp: float, chain: pd.DataFrame):
-        cfg      = SYMBOLS[symbol]
-        step     = cfg["strike_step"]
-        atm      = int(round(ltp / step) * step)
-        pcr      = self._calc_pcr(chain)
-        max_pain = self._calc_maxpain(chain)
+        now = datetime.now(IST).time()
+        t1s = datetime.strptime("09:25", "%H:%M").time()
+        t1e = datetime.strptime("11:30", "%H:%M").time()
+        t2s = datetime.strptime("13:30", "%H:%M").time()
+        t2e = datetime.strptime("15:15", "%H:%M").time()
+        if not ((t1s <= now <= t1e) or (t2s <= now <= t2e)):
+            return
 
-        self.scan_stats[symbol].update({
-            "pcr": round(pcr, 2), "max_pain": max_pain, "atm": atm})
+        row  = df.iloc[-1]
+        ema9, ema20, ema50 = row["EMA9"], row["EMA20"], row["EMA50"]
 
-        atm_rows = chain[chain["strike"] == atm]
-        if atm_rows.empty:
-            atm_rows = chain.iloc[(chain["strike"] - atm).abs().argsort()[:1]]
-        row = atm_rows.iloc[0]
+        real_body  = abs(row["close"] - row["open"])
+        real_lower = min(row["open"], row["close"]) - row["low"]
+        real_upper = row["high"] - max(row["open"], row["close"])
+        range_     = row["high"] - row["low"]
 
-        ce_iv  = float(row.get("ce_iv",      0) or 0)
-        pe_iv  = float(row.get("pe_iv",      0) or 0)
-        ce_oi  = float(row.get("ce_oi",      0) or 0)
-        pe_oi  = float(row.get("pe_oi",      0) or 0)
-        ce_bid = float(row.get("ce_bid_qty", 0) or 0)
-        ce_ask = float(row.get("ce_ask_qty", 0) or 0)
-        pe_bid = float(row.get("pe_bid_qty", 0) or 0)
-        pe_ask = float(row.get("pe_ask_qty", 0) or 0)
+        noise_min = 10 if sym == "BANKNIFTY" else 5
+        if real_body < noise_min or range_ == 0:
+            return
 
-        prev_oi = self._prev_oi.get(symbol, {})
-        prev_iv = self._prev_iv.get(symbol, {})
-        self._prev_oi[symbol] = {"ce": ce_oi, "pe": pe_oi}
-        self._prev_iv[symbol] = {"ce": ce_iv, "pe": pe_iv}
+        hammer = (real_lower >= real_body * 2 and real_upper <= real_body
+                  and real_body / range_ >= 0.25)
+        star   = (real_upper >= real_body * 2 and real_lower <= real_body
+                  and real_body / range_ >= 0.25)
 
-        if not prev_oi:
-            return None
+        prev_high = df.iloc[-11:-1]["high"].max()
+        prev_low  = df.iloc[-11:-1]["low"].min()
+        fall      = prev_high - row["low"]
+        rise      = row["high"] - prev_low
+        move_min  = 200  # same for both
 
-        pe_oi_chg = ((pe_oi - prev_oi.get("pe", pe_oi)) / (prev_oi.get("pe", pe_oi) + 1)) * 100
-        ce_oi_chg = ((ce_oi - prev_oi.get("ce", ce_oi)) / (prev_oi.get("ce", ce_oi) + 1)) * 100
-        ce_iv_spk = ((ce_iv - prev_iv.get("ce", ce_iv)) / (prev_iv.get("ce", ce_iv) + 0.01)) * 100
-        pe_iv_spk = ((pe_iv - prev_iv.get("pe", pe_iv)) / (prev_iv.get("pe", pe_iv) + 0.01)) * 100
+        temp_side, temp_pattern, temp_entry, temp_sl = None, "", 0, 0
 
-        # CE: all 5 conditions
-        if (pcr < PCR_CE_THRESHOLD and ltp > max_pain and
-                pe_oi_chg < -OI_REDUCE_PCT and ce_iv_spk > IV_SPIKE_PCT and ce_bid > ce_ask):
-            r = chain[chain["strike"] == atm].iloc[0]
-            if "ce_tradingsymbol" not in r.index:
-                return None
-            return {"side": "CE", "strike": atm,
-                    "entry": float(r.get("ce_ltp", 0)),
-                    "option_symbol": r["ce_tradingsymbol"],
-                    "token": int(r.get("ce_token", 0))}
+        if hammer and fall >= move_min:
+            temp_side, temp_pattern = "CE", "HAMMER REVERSAL"
+            temp_entry, temp_sl     = row["high"], row["low"]
+        elif star and rise >= move_min:
+            temp_side, temp_pattern = "PE", "SHOOTING STAR"
+            temp_entry, temp_sl     = row["low"], row["high"]
 
-        # PE: all 5 conditions
-        if (pcr > PCR_PE_THRESHOLD and ltp < max_pain and
-                ce_oi_chg < -OI_REDUCE_PCT and pe_iv_spk > IV_SPIKE_PCT and pe_ask > pe_bid):
-            r = chain[chain["strike"] == atm].iloc[0]
-            if "pe_tradingsymbol" not in r.index:
-                return None
-            return {"side": "PE", "strike": atm,
-                    "entry": float(r.get("pe_ltp", 0)),
-                    "option_symbol": r["pe_tradingsymbol"],
-                    "token": int(r.get("pe_token", 0))}
+        if not temp_side:
+            return
 
-        return None
+        buf = 50 if sym == "BANKNIFTY" else 20
+        entry = temp_entry
+        if temp_side == "CE":
+            if (entry < ema9 < entry + buf or entry < ema20 < entry + buf
+                    or entry < ema50 < entry + buf):
+                return
+        else:
+            if (entry > ema9 > entry - buf or entry > ema20 > entry - buf
+                    or entry > ema50 > entry - buf):
+                return
 
-    # ── Trade Open ───────────────────────────────────────────────────
-    def _open_trade(self, symbol: str, result: dict):
-        cfg      = SYMBOLS[symbol]
-        entry_px = result["entry"]
-        trade    = {
-            "side":          result["side"],
-            "entry":         entry_px,
-            "sl":            round(entry_px - cfg["sl_points"], 1),
-            "target_level":  0,
-            "peak":          entry_px,
-            "cur_ltp":       entry_px,
-            "option_symbol": result["option_symbol"],
-            "token":         result["token"],
-            "strike":        result["strike"],
-            "open_time":     datetime.now(IST).strftime("%H:%M:%S"),
-            "symbol":        symbol,
-            "direction":     "CALL" if result["side"] == "CE" else "PUT",
-            # For dashboard
-            "target": round(entry_px + cfg["target_step"], 1),
-            "lots":   1,
-            "sym_key": cfg["dash_key"],
+        self._pending_reversal[sym] = {
+            "side":    temp_side,
+            "pattern": temp_pattern,
+            "entry":   temp_entry,
+            "sl":      temp_sl,
         }
-        self.active_trades[symbol] = trade
-        self.scan_stats[symbol]["status"] = f"TRADE {result['side']}"
-        self.on_trade_open(symbol, trade)
-        self._alert_entry(symbol, trade)
-        log.info(f"[{symbol}] Trade opened {result['side']} @ {entry_px}")
 
-    # ── Trade Monitor ────────────────────────────────────────────────
-    def _monitor(self, symbol: str, opt_ltp: float):
-        trade = self.active_trades.get(symbol)
+        lbl = "Above 📈" if temp_side == "CE" else "Below 📉"
+        em  = "🔵" if temp_side == "CE" else "🔴"
+        send_telegram(
+            f"{em} <b>{sym} Reversal Signal</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 Pattern: {temp_pattern}\n"
+            f"Side: {temp_side}\n"
+            f"Entry {lbl}: {temp_entry}\n"
+            f"Index SL Ref: {temp_sl}\n"
+            f"⏳ Waiting for breakout..."
+        )
+
+    def _check_reversal_trigger(self, sym: str, index_ltp: float):
+        """Check if pending reversal has been triggered (on every tick)."""
+        pending = self._pending_reversal.get(sym)
+        if not pending or sym in self.active_trades:
+            return
+
+        side    = pending["side"]
+        entry   = pending["entry"]
+        triggered = (side == "CE" and index_ltp >= entry) or \
+                    (side == "PE" and index_ltp <= entry)
+
+        if not triggered:
+            return
+
+        # Clear pending
+        del self._pending_reversal[sym]
+
+        # Get option at trigger point
+        is_bn   = sym == "BANKNIFTY"
+        opt_step = 100 if is_bn else 50
+        name_key = "BANKNIFTY" if is_bn else "NIFTY"
+        strike  = get_atm_strike(index_ltp, opt_step)
+        opt_sym = get_option_symbol(self._nfo_instruments, strike, side, name_key)
+        opt_ltp = get_option_ltp(self.kite, opt_sym)
+
+        if opt_ltp <= 0:
+            log.warning(f"Reversal trigger: Option LTP zero for {opt_sym}")
+            return
+
+        opt_sl  = BN_OPT_SL  if is_bn else NF_OPT_SL
+        opt_t1  = BN_OPT_TARGET1 if is_bn else NF_OPT_TARGET1
+        lot_qty = BN_OPT_LOT if is_bn else NF_OPT_LOT
+
+        sl_price     = round(opt_ltp - opt_sl, 1)
+        target_price = round(opt_ltp + opt_t1, 1)
+
+        trade = {
+            "symbol":        sym,
+            "pattern":       pending["pattern"],
+            "side":          side,
+            "direction":     "CALL" if side == "CE" else "PUT",
+            "entry_index":   index_ltp,
+            "option_symbol": opt_sym,
+            "strike":        strike,
+            "entry":         opt_ltp,
+            "sl":            sl_price,
+            "target":        target_price,
+            "peak":          opt_ltp,
+            "cur_ltp":       opt_ltp,
+            "target_level":  0,
+            "open_time":     datetime.now(IST).strftime("%H:%M:%S"),
+            "lots":          1,
+            "lot_qty":       lot_qty,
+            "sym_key":       "bn" if is_bn else "nf",
+            "token":         0,
+        }
+        self.active_trades[sym] = trade
+        self.scan_stats[sym]["status"] = f"TRADE {side}"
+        self.on_trade_open(sym, trade)
+
+        em = "🔵" if side == "CE" else "🔴"
+        send_telegram(
+            f"🚀 <b>{sym} REVERSAL ACTIVATED</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📌 Pattern: {pending['pattern']}\n"
+            f"📊 Side: BUY {side} — {opt_sym}\n"
+            f"💰 <b>Option Entry:</b> ₹{opt_ltp}\n"
+            f"🛑 <b>Option SL:</b> ₹{sl_price}  (−{opt_sl} pts)\n"
+            f"🎯 <b>Option T1:</b> ₹{target_price}  (+{opt_t1} pts)\n"
+            f"📈 Index Trigger: {index_ltp}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 {datetime.now(IST).strftime('%d %b %Y  %H:%M:%S')}"
+        )
+
+    # ─────────────────────────────────────────────
+    #  MEAN REVERSION
+    # ─────────────────────────────────────────────
+    def _scan_mean_reversion(self, sym: str, df: pd.DataFrame):
+        if not is_market_open() or sym in self.active_trades:
+            return
+        if sym in self._mr_state:
+            return
+
+        row  = df.iloc[-1]
+        prev = df.iloc[-2]
+
+        close    = row["close"]
+        ema200   = row.get("EMA200", 0) or 0
+        rsi      = row["RSI"]
+        prev_rsi = prev["RSI"]
+        lower    = row.get("BBL", 0) or 0
+        upper    = row.get("BBU", 0) or 0
+        mid      = row.get("BBM", close) or close
+
+        if ema200 == 0 or lower == 0:
+            return
+
+        swing_low  = df.iloc[-10:-1]["low"].min()
+        swing_high = df.iloc[-10:-1]["high"].max()
+        is_bn      = sym == "BANKNIFTY"
+        name       = "BankNifty" if is_bn else "Nifty"
+
+        side = None
+        if close < lower and prev_rsi < 30 and rsi > prev_rsi and close > ema200:
+            side = "CE"
+        elif close > upper and prev_rsi > 70 and rsi < prev_rsi and close < ema200:
+            side = "PE"
+
+        if not side:
+            return
+
+        opt_step = 100 if is_bn else 50
+        name_key = "BANKNIFTY" if is_bn else "NIFTY"
+        strike   = get_atm_strike(close, opt_step)
+        opt_sym  = get_option_symbol(self._nfo_instruments, strike, side, name_key)
+        opt_ltp  = get_option_ltp(self.kite, opt_sym)
+
+        if opt_ltp <= 0:
+            return
+
+        opt_sl  = BN_OPT_SL  if is_bn else NF_OPT_SL
+        opt_t1  = BN_OPT_TARGET1 if is_bn else NF_OPT_TARGET1
+        lot_qty = BN_OPT_LOT if is_bn else NF_OPT_LOT
+
+        sl_price     = round(opt_ltp - opt_sl, 1)
+        target_price = round(opt_ltp + opt_t1, 1)
+
+        trade = {
+            "symbol":        sym,
+            "pattern":       "MEAN REVERSION",
+            "side":          side,
+            "direction":     "CALL" if side == "CE" else "PUT",
+            "entry_index":   close,
+            "option_symbol": opt_sym,
+            "strike":        strike,
+            "entry":         opt_ltp,
+            "sl":            sl_price,
+            "target":        target_price,
+            "peak":          opt_ltp,
+            "cur_ltp":       opt_ltp,
+            "target_level":  0,
+            "open_time":     datetime.now(IST).strftime("%H:%M:%S"),
+            "lots":          1,
+            "lot_qty":       lot_qty,
+            "sym_key":       "bn" if is_bn else "nf",
+            "token":         0,
+        }
+        self.active_trades[sym] = trade
+        self._mr_state[sym]     = True
+        self.scan_stats[sym]["status"] = f"TRADE {side}"
+        self.on_trade_open(sym, trade)
+
+        send_telegram(
+            f"🟡 <b>{name} MEAN REVERSION</b>\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📊 Side: BUY {side} — {opt_sym}\n"
+            f"💰 <b>Option Entry:</b> ₹{opt_ltp}\n"
+            f"🛑 <b>Option SL:</b> ₹{sl_price}\n"
+            f"🎯 <b>Option T1:</b> ₹{target_price}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"🕐 {datetime.now(IST).strftime('%d %b %Y  %H:%M:%S')}"
+        )
+
+    # ─────────────────────────────────────────────
+    #  ACTIVE TRADE MONITOR (on every index tick)
+    # ─────────────────────────────────────────────
+    def _check_active_trade(self, sym: str, index_ltp: float):
+        trade = self.active_trades.get(sym)
         if not trade:
             return
-        cfg   = SYMBOLS[symbol]
-        entry = trade["entry"]
-        sl    = trade["sl"]
-        step  = cfg["target_step"]
-        level = trade["target_level"]
 
-        trade["peak"]    = max(trade.get("peak", opt_ltp), opt_ltp)
-        trade["cur_ltp"] = opt_ltp
-
-        if opt_ltp <= sl:
-            if level == 0:
-                self._alert_sl_hit(symbol, trade, opt_ltp)
-            else:
-                self._alert_trail_hit(symbol, trade, opt_ltp)
-            self._close_trade(symbol, opt_ltp, "SL" if level == 0 else "TRAIL_SL")
+        # Fetch live option LTP
+        opt_sym = trade.get("option_symbol", "")
+        if not opt_sym:
             return
 
+        opt_ltp = get_option_ltp(self.kite, opt_sym)
+        if opt_ltp <= 0:
+            return
+
+        trade["cur_ltp"] = opt_ltp
+        trade["peak"]    = max(trade.get("peak", opt_ltp), opt_ltp)
+
+        entry   = trade["entry"]
+        sl      = trade["sl"]
+        step    = BN_OPT_TRAIL if sym == "BANKNIFTY" else NF_OPT_TRAIL
+        level   = trade["target_level"]
+
+        # ── SL Hit ──
+        if opt_ltp <= sl:
+            pnl_pts = round(opt_ltp - entry, 1)
+            pnl_rs  = round(pnl_pts * trade.get("lot_qty", 1), 0)
+            status  = "SL" if level == 0 else "TRAIL_SL"
+            em      = "❌" if pnl_pts < 0 else "✅"
+            txt     = "Closed in Loss" if pnl_pts < 0 else "Closed in Profit"
+
+            send_telegram(
+                f"{em} <b>{sym} {trade['pattern']} EXIT</b>\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"📊 {trade['side']} — {opt_sym}\n"
+                f"💰 Entry: ₹{entry}  →  Exit: ₹{opt_ltp}\n"
+                f"📉 P&L: {'+' if pnl_pts >= 0 else ''}{pnl_pts} pts  |  "
+                f"₹{'+' if pnl_rs >= 0 else ''}{int(pnl_rs)}\n"
+                f"🏷 {txt}\n"
+                f"━━━━━━━━━━━━━━━━━━\n"
+                f"🕐 {datetime.now(IST).strftime('%d %b %Y  %H:%M:%S')}"
+            )
+            self._close_trade(sym, opt_ltp, status)
+            return
+
+        # ── Target / Trail ──
         new_level = int((opt_ltp - entry) // step)
         if new_level > level:
             for lvl in range(level + 1, new_level + 1):
-                new_sl = round(entry + (lvl - 1) * step, 1)
+                new_sl   = round(entry + (lvl - 1) * step, 1)
+                new_tgt  = round(entry + (lvl + 1) * step, 1)
+                pts_hit  = lvl * step
                 trade["sl"]           = new_sl
+                trade["target"]       = new_tgt
                 trade["target_level"] = lvl
-                trade["target"]       = round(entry + (lvl + 1) * step, 1)
-                self._alert_target(symbol, trade, lvl, opt_ltp, new_sl)
 
-    def _close_trade(self, symbol: str, exit_px: float, reason: str):
-        trade = self.active_trades.pop(symbol, None)
+                send_telegram(
+                    f"🎯 <b>{sym} {trade['pattern']} Target {lvl} Hit!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"📊 {trade['side']} — {opt_sym}\n"
+                    f"💰 Option LTP: ₹{opt_ltp}  (+{pts_hit} pts)\n"
+                    f"🔒 SL Trailed → ₹{new_sl}  (+{(lvl-1)*step} pts)\n"
+                    f"🎯 Next Target: ₹{new_tgt}\n"
+                    f"━━━━━━━━━━━━━━━━━━\n"
+                    f"🕐 {datetime.now(IST).strftime('%d %b %Y  %H:%M:%S')}"
+                )
+
+    def _close_trade(self, sym: str, exit_px: float, reason: str):
+        trade = self.active_trades.pop(sym, None)
         if not trade:
             return
-        cfg    = SYMBOLS[symbol]
-        pnl    = round((exit_px - trade["entry"]) * cfg["lot_size"], 1)
-        record = {
+        lot_qty = trade.get("lot_qty", 1)
+        pnl     = round((exit_px - trade["entry"]) * lot_qty, 1)
+        record  = {
             "date":      datetime.now(IST).strftime("%Y-%m-%d"),
-            "symbol":    symbol,
+            "symbol":    sym,
+            "pattern":   trade.get("pattern", ""),
             "direction": trade["direction"],
             "opt_sym":   trade["option_symbol"],
             "strike":    trade["strike"],
@@ -405,9 +831,10 @@ class OCSScanner:
             "status":    reason,
         }
         self._save_trade(record)
-        self.scan_stats[symbol]["status"] = "No Trade"
-        self.on_trade_close(symbol)
-        self.on_scan_update(symbol, self.scan_stats[symbol])
+        self.scan_stats[sym]["status"] = "No Trade"
+        self._mr_state.pop(sym, None)
+        self.on_trade_close(sym)
+        self.on_scan_update(sym, self.scan_stats[sym])
 
     def _save_trade(self, record: dict):
         trades = []
@@ -420,84 +847,3 @@ class OCSScanner:
         trades.append(record)
         with open(TRADE_FILE, "w") as f:
             json.dump(trades, f)
-
-    # ── Utilities ────────────────────────────────────────────────────
-    def _nearest_expiry(self, symbol: str, exchange: str) -> str:
-        df = pd.DataFrame(self.kite.instruments(exchange))
-        df = df[df["name"] == symbol].copy()
-        df["expiry"] = pd.to_datetime(df["expiry"])
-        df = df[df["expiry"] >= pd.Timestamp(date.today())]
-        return df["expiry"].min().strftime("%Y-%m-%d")
-
-    @staticmethod
-    def _calc_pcr(chain: pd.DataFrame) -> float:
-        ce = chain["ce_oi"].sum()
-        pe = chain["pe_oi"].sum()
-        return pe / ce if ce else 0.0
-
-    @staticmethod
-    def _calc_maxpain(chain: pd.DataFrame) -> float:
-        mp, ml = 0, float("inf")
-        for s in sorted(chain["strike"].dropna().unique()):
-            loss = (((chain["strike"] - s).clip(lower=0) * chain["ce_oi"]) +
-                    ((s - chain["strike"]).clip(lower=0) * chain["pe_oi"])).sum()
-            if loss < ml:
-                ml, mp = loss, s
-        return float(mp)
-
-    # ── Alert Messages ───────────────────────────────────────────────
-    def _alert_entry(self, symbol, trade):
-        cfg  = SYMBOLS[symbol]
-        e, sl, t1 = trade["entry"], trade["sl"], trade["target"]
-        em   = "🟢" if trade["side"] == "CE" else "🔴"
-        send_telegram(
-            f"{em} <b>OC Confluence Trigger — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📌 <b>Pattern:</b> OC Confluence Trigger\n"
-            f"📊 <b>Side:</b> {trade['side']} — {trade['option_symbol']}\n"
-            f"💰 <b>Entry:</b> ₹{e}\n"
-            f"🛑 <b>Initial SL:</b> ₹{sl}  (−{cfg['sl_points']} pts)\n"
-            f"🎯 <b>Target 1:</b> ₹{t1}  (+{cfg['target_step']} pts)\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 {datetime.now(IST).strftime('%d %b %Y  %H:%M:%S')}"
-        )
-
-    def _alert_sl_hit(self, symbol, trade, ltp):
-        loss = round(trade["entry"] - ltp, 1)
-        send_telegram(
-            f"❌ <b>OC Confluence Trigger — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🚨 <b>Pattern:</b> Exit — Initial SL Hit\n"
-            f"📊 <b>Side:</b> {trade['side']} — {trade['option_symbol']}\n"
-            f"📉 <b>Trade Closed in Loss:</b> −{loss} pts\n"
-            f"💸 LTP: ₹{ltp}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 {datetime.now(IST).strftime('%d %b %Y  %H:%M:%S')}"
-        )
-
-    def _alert_target(self, symbol, trade, level, ltp, new_sl):
-        cfg = SYMBOLS[symbol]
-        pts = level * cfg["target_step"]
-        send_telegram(
-            f"🎯 <b>OC Confluence Trigger — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"✅ <b>Target {level} Hit  +{pts} pts</b>\n"
-            f"📊 <b>Side:</b> {trade['side']} — {trade['option_symbol']}\n"
-            f"📈 <b>LTP:</b> ₹{ltp}\n"
-            f"🔒 <b>SL Trailed To:</b> ₹{new_sl}  (+{(level-1)*cfg['target_step']} pts)\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 {datetime.now(IST).strftime('%d %b %Y  %H:%M:%S')}"
-        )
-
-    def _alert_trail_hit(self, symbol, trade, ltp):
-        profit = round(ltp - trade["entry"], 1)
-        send_telegram(
-            f"✅ <b>OC Confluence Trigger — {symbol}</b>\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🏁 <b>Trade Closed — Trailing SL Hit</b>\n"
-            f"📊 <b>Side:</b> {trade['side']} — {trade['option_symbol']}\n"
-            f"💚 <b>Trade Closed in Profit: +{profit} pts</b>\n"
-            f"Exit LTP: ₹{ltp}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"🕐 {datetime.now(IST).strftime('%d %b %Y  %H:%M:%S')}"
-        )
