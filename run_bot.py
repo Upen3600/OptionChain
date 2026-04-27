@@ -17,7 +17,6 @@ def start():
 
     start_ticker(token, scanner)
 
-    # MAIN PROCESS (important for Railway)
     run_dashboard()
 
 if __name__ == "__main__":

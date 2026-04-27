@@ -1,6 +1,8 @@
 
 import os
 import pyotp
+import subprocess
+import sys
 import logging
 from kiteconnect import KiteConnect
 from playwright.sync_api import sync_playwright
@@ -13,7 +15,19 @@ USER_ID       = os.environ.get("KITE_USER_ID")
 PASSWORD      = os.environ.get("KITE_PASSWORD")
 TOTP_SECRET   = os.environ.get("TOTP_SECRET")
 
+def ensure_browser():
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True
+        )
+        log.info("✅ Playwright browser installed")
+    except Exception as e:
+        log.error(f"Playwright install error: {e}")
+
 def get_access_token():
+    ensure_browser()
+
     kite = KiteConnect(api_key=API_KEY)
     login_url = kite.login_url()
 
