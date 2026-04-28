@@ -31,8 +31,7 @@ SYMBOL_TOKENS = {
 
 app      = Flask(__name__)
 app.config["SECRET_KEY"] = "friday_dual_beta_2025"
-# ✅ FIX: async_mode changed from "eventlet" → "gevent"
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode="gevent")
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode="eventlet")
 
 # ── Shared state ──
 _tick_data = {
@@ -122,6 +121,7 @@ def start_ticker(access_token: str, scanner=None):
             active_list = list(_active_trades.values())
             active = next((t for t in active_list if t.get("sym_key") == key), None)
             if active:
+                # Update cur_ltp using scanner's live value
                 if _scanner_ref and info["name"] in _scanner_ref.active_trades:
                     st = _scanner_ref.active_trades[info["name"]]
                     active["cur_ltp"] = st.get("cur_ltp", active.get("cur_ltp", 0))
@@ -134,6 +134,7 @@ def start_ticker(access_token: str, scanner=None):
                     "target":  active.get("target", 0),
                 })
 
+            # Emit tick
             socketio.emit("tick", {
                 "sym": key, "ltp": round(ltp, 2),
                 "high": round(high, 2), "low": round(low, 2),
@@ -200,6 +201,7 @@ def api_trades():
 
 @app.route("/api/active")
 def api_active():
+    # Sync cur_ltp from scanner before returning
     for key, trade in _active_trades.items():
         if _scanner_ref:
             sym = trade.get("symbol", "")
@@ -469,6 +471,7 @@ function applyTick(d){
   prevLtp[s]=ltp;
   el.textContent=fn(ltp);
 
+  // High / Low
   const h=document.getElementById(s+'-high');
   const l=document.getElementById(s+'-low');
   const t=document.getElementById(s+'-time');
@@ -476,6 +479,7 @@ function applyTick(d){
   if(l)l.textContent=fn(d.low);
   if(t)t.textContent=d.time||'';
 
+  // Change
   const chg=d.change||0,chgp=d.change_pct||0;
   const cEl=document.getElementById(s+'-chg');
   if(cEl){
@@ -613,12 +617,15 @@ socket.on('scan_update',d=>{
 
 socket.on('active_trade',d=>renderActive(d.active));
 
+// Live option LTP update on every tick
 socket.on('trade_ltp_update',d=>{
   const panel=document.getElementById('active-panel');
   if(!panel.classList.contains('atrade'))return;
+  // Update live LTP in P&L box without full re-render
   const cur=d.cur_ltp||0;
   const el=document.getElementById('live-opt-ltp');
   if(el)el.textContent='₹'+cur.toFixed(2);
+  // Full re-render from /api/active every 2s handles P&L
 });
 
 socket.on('snapshot',d=>{
@@ -632,6 +639,7 @@ socket.on('snapshot',d=>{
   if(d.active!==undefined)renderActive(d.active);
 });
 
+// Poll active trade P&L every 2 seconds for live option price
 setInterval(()=>{
   fetch('/api/active').then(r=>r.json()).then(d=>renderActive(d.active)).catch(()=>{});
 },2000);
@@ -648,13 +656,12 @@ setInterval(()=>{
 #  START
 # ─────────────────────────────────────────────
 def run_dashboard():
-    # ✅ FIX: gevent use ho raha hai, eventlet nahi
-    # monkey_patch run_bot.py ke top pe hoti hai — yahan kuch nahi karna
+    import eventlet
+    import eventlet.wsgi
+    eventlet.monkey_patch()
     socketio.run(app, host="0.0.0.0", port=PORT,
                  debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":
-    from gevent import monkey
-    monkey.patch_all()
     run_dashboard()
